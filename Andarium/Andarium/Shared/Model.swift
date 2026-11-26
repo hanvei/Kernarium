@@ -846,6 +846,11 @@ final class AppModel {
     private var nextDisplaySize: (width: Int, height: Int)? {
         resolutionLayout.map { ($0.width, $0.height) }
     }
+    /// The display the next start lays out: its size in pixels with the
+    /// density Android reads it at (`GuestDisplayLayout`).
+    private var nextDisplay: (width: Int, height: Int, dotsPerInch: Int)? {
+        resolutionLayout.map { ($0.width, $0.height, $0.dotsPerInch) }
+    }
     /// Home's "120 Hz" in Performance: whether the next Android start asks
     /// for a 120 Hz display. Off is the default. Kept for the install
     /// (`HighRefreshPreference`).
@@ -882,6 +887,51 @@ final class AppModel {
     /// whatever the start asked).
     func runStarted(withHighRefresh granted: Bool) {
         runHasHighRefresh = granted
+    }
+
+    // "Tablet layout" (Home's row in Virtual machine): Android takes the
+    // two-column layout of a large screen, which the density the start
+    // passes gives it. The switch applies to the next start.
+    /// Whether the person wants it. Off is the default. Kept for the install
+    /// (`TabletLayoutPreference`).
+    var tabletLayoutOn = false
+    /// The launch decided it (automation): the value belongs to that run and
+    /// is not kept.
+    var tabletLayoutDecidedByLaunch = false
+    /// What is kept of the setting across launches; nil where the launch
+    /// decided it.
+    var tabletLayoutToKeep: Bool? { tabletLayoutDecidedByLaunch ? nil : tabletLayoutOn }
+    /// Whether Home offers the row: the display the next start gives the
+    /// guest is known and a density answers it. A display already as wide as
+    /// a tablet reads as one without a choice, so the row is not offered
+    /// there (`TabletLayout.applies`).
+    var tabletLayoutOffered: Bool { tabletLayoutApplies(forStartWith: nextDisplay) }
+    /// Whether a start now applies the density: the setting is on and a
+    /// density answers the display the next start lays out.
+    var tabletLayoutApplies: Bool {
+        tabletLayoutApplies(forStartWith: nextDisplay)
+    }
+    /// The same for a start whose display size is known: the size it boots at,
+    /// and the density Android reads it at. `display` nil (Home before the
+    /// window is read) answers by the setting alone.
+    func tabletLayoutApplies(forStartWith display: (width: Int, height: Int, dotsPerInch: Int)?) -> Bool {
+        guard let display else { return tabletLayoutOn }
+        return TabletLayout.applies(
+            isOn: tabletLayoutOn, widthPixels: display.width, naturalDotsPerInch: display.dotsPerInch)
+    }
+    /// The density a start with the display it lays out passes in the boot
+    /// request, or nil where none applies (`TabletLayout.density`). The
+    /// runtime writes it into the kernel argument `androidboot.lcd_density`,
+    /// which Android keeps as its `ro.sf.lcd_density`.
+    func tabletLayoutDensity(forStartWith display: (width: Int, height: Int, dotsPerInch: Int)?) -> Int? {
+        guard let display, tabletLayoutOn else { return nil }
+        return TabletLayout.density(
+            widthPixels: display.width, naturalDotsPerInch: display.dotsPerInch)
+    }
+    /// Home's "Tablet layout". It applies at the next start.
+    func setTabletLayout(_ on: Bool) {
+        guard on != tabletLayoutOn else { return }
+        tabletLayoutOn = on
     }
 
     /// The thermal policy holds the device hot (iOS's critical state, the

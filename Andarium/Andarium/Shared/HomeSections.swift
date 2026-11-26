@@ -161,12 +161,14 @@ struct RowDivider: View {
 
 // MARK: System
 
-/// The guest's system in one section, as four rows of one shape: CPU and
+/// The guest's system in one section, as rows of one shape: CPU and
 /// memory states the vCPUs and RAM, with Edit opening the sheet that changes
 /// them; Resolution states the guest's display, with Change opening its
-/// choices (`ResolutionRow`); Storage states what the guest holds of its
-/// capacity under a bar, with Resize; Snapshots states how many there are and
-/// the space they use, with Manage opening them.
+/// choices (`ResolutionRow`); where the display the next start gives the
+/// guest would not read as a tablet on its own, "Tablet layout" offers the
+/// density that makes it one (`TabletLayoutRow`); Storage states what the
+/// guest holds of its capacity under a bar, with Resize; Snapshots states how
+/// many there are and the space they use, with Manage opening them.
 struct SystemSection: View {
     @Environment(AppModel.self) private var model
 
@@ -183,6 +185,10 @@ struct SystemSection: View {
                 )
                 RowDivider()
                 ResolutionRow()
+                if model.tabletLayoutOffered {
+                    RowDivider()
+                    TabletLayoutRow()
+                }
                 RowDivider()
                 StorageRow(guest: guest, stops: model.capacityStopsGiB, resize: { model.sheet = .resize })
                 RowDivider()
@@ -195,6 +201,44 @@ struct SystemSection: View {
     static func summary(of guest: Guest) -> String {
         "\(CountWords.vcpus(guest.cores)) · \(Formats.size(mib: guest.memoryMiB))"
     }
+
+    /// Whether the next start of Android takes the two-column layout of a
+    /// large screen (`AppModel.tabletLayoutOn`, kept for the install, off at
+    /// first). The row is drawn only where the display the next start gives
+    /// the guest would not read as a tablet without it, so a large window
+    /// keeps what it already is. It applies at the next start (Home shows
+    /// only while no guest runs).
+    struct TabletLayoutRow: View {
+        @Environment(AppModel.self) private var model
+
+        var body: some View {
+            OptionRow(
+                title: String(localized: "Tablet layout"), symbol: "rectangle.split.2x2",
+                detail: TabletLayoutWords.summary
+            ) {
+                Toggle("Tablet layout", isOn: Binding(
+                    get: { model.tabletLayoutOn },
+                    set: { model.setTabletLayout($0) }
+                ))
+                .labelsHidden()
+                .accessibilityIdentifier("home-tablet-layout-switch")
+            }
+            // VoiceOver says the summary, which the detail line holds, and
+            // then the name.
+            .accessibilityLabel(TabletLayoutWords.spoken)
+            .accessibilityInputLabels([String(localized: "Tablet layout")])
+            .id("tablet-layout")
+        }
+    }
+}
+
+/// The words of Home's "Tablet layout" row.
+enum TabletLayoutWords {
+    /// The line under the row's title: what the display becomes. Fixed
+    /// English, as the summary of the display's size is.
+    static let summary = String(localized: "Like a folding phone\u{2019}s inner display")
+    /// What VoiceOver says for the row: the summary and the name.
+    static let spoken: String = "\(summary), \(String(localized: "Tablet layout"))"
 }
 
 /// The button at the end of a Virtual machine row.
