@@ -1,0 +1,199 @@
+# Build an installable Andarium IPA from this fork, on a GitHub macOS runner.
+#
+# The official build chain (Andarium/README.md) runs: the pinned dependency
+# prefixes, the CMake Android runtime, the packaged runtime frameworks, the
+# staged Android system release, and an unsigned Release archive, packed as
+# an IPA AltStore or SideStore can sign with an Apple ID.
+#
+# The checkout is moved to /ci so no build path names a home directory, a
+# volume or a temporary directory (check-release-archive.py refuses those).
+name: Build Andarium IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream-tag:
+        description: "Upstream release tag for the kernel and system image"
+        default: andarium-1.1
+        type: string
+  push:
+    branches: [main]
+
+env:
+  UPSTREAM_REPO: imxieyi/Kernarium
+  RELEASE_TAG: ${{ inputs.upstream-tag || 'andarium-1.1' }}
+  CI_ROOT: /ci
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 350
+    steps:
+      - name: Select the newest Xcode (needs the iOS 26 SDK)
+        run: |
+          XCODE=$(ls -d /Applications/Xcode*.app | sort -V | tail -1)
+          sudo xcode-select -s "$XCODE"
+          xcodebuild -version
+          xcodebuild -showsdks | grep -i iphoneos
+
+      - name: Install the build tools
+        run: |
+          brew install cmake ninja meson python@3.12 pkg-config \
+            autoconf automake gettext libtool gperf groff rsync
+          # python3 on the runner is 3.9; the project needs 3.11+.
+          echo "$(brew --prefix)/opt/python@3.12/libexec/bin" >> "$GITHUB_PATH"
+          cmake --version | head -1
+          ninja --version
+          meson --version
+
+      - name: Download the Metal toolchain (the GPU prefix builds need it)
+        run: xcodebuild -downloadComponent MetalToolchain
+
+      - name: Clone this fork to a neutral path
+        run: |
+          git config --global user.name "CI"
+          git config --global user.email "ci@example.com"
+          sudo mkdir -p "$CI_ROOT"
+          sudo chown "$(id -un)" "$CI_ROOT"
+          git clone --depth 1 "https://github.com/${GITHUB_REPOSITORY}.git" "$CI_ROOT/kernarium"
+          cd "$CI_ROOT/kernarium"
+          git fetch --depth 1 origin "$GITHUB_SHA"
+          git checkout -q "$GITHUB_SHA"
+          git log -1 --oneline
+          df -h /
+
+      - name: Fetch the pinned dependency sources
+        run: |
+          cd "$CI_ROOT/kernarium/dependencies"
+          ./prepare.sh --product apple-gpu-vulkan-experiment
+          ./prepare.sh --product ios-network
+          ./prepare.sh --product ios-storage
+          ./prepare.sh --product ios-compression
+
+      - name: Build the iOS GPU prefix (Mesa/KosmicKrisp — the long step)
+        run: |
+          cd "$CI_ROOT/kernarium/dependencies"
+          ./build-apple-gpu.sh --platform ios
+          df -h /
+
+      - name: Build the network, storage and compression prefixes
+        run: |
+          cd "$CI_ROOT/kernarium/dependencies"
+          ./build-ios-network.sh --platform ios \
+            --prefix "$CI_ROOT/kernarium/.build/dependencies/ios-device-arm64/network"
+          ./build-ios-storage.sh
+          ./build-ios-zstd.sh
+          df -h /
+
+      - name: Download the accepted kernel and Android release
+        run: |
+          mkdir -p "$CI_ROOT/downloads"
+          cd "$CI_ROOT/downloads"
+          gh release download "$RELEASE_TAG" -R "$UPSTREAM_REPO" \
+            -p 'android-6.18-arm64-4k-*.tar.gz' --clobber
+          gh release download "$RELEASE_TAG" -R "$UPSTREAM_REPO" \
+            -p 'lineage24-*.tar.gz' --clobber
+          ls -lh
+          df -h /
+
+      - name: Install the kernel artifacts
+        run: |
+          cd "$CI_ROOT/kernarium"
+          mkdir -p .build/kernel/artifacts
+          tar -xzf "$CI_ROOT"/downloads/android-6.18-arm64-4k-*.tar.gz \
+            -C .build/kernel/artifacts
+          # Flatten a single top-level directory, if the tarball has one.
+          entries=$(ls .build/kernel/artifacts)
+          if [ "$(printf '%s\n' "$entries" | wc -l)" -eq 1 ] \
+            && [ -d ".build/kernel/artifacts/$entries" ]; then
+            mv ".build/kernel/artifacts/$entries"/* .build/kernel/artifacts/
+            rmdir ".build/kernel/artifacts/$entries"
+          fi
+          ls -la .build/kernel/artifacts
+
+      - name: Install the Android system release and the AOT artifact
+        run: |
+          cd "$CI_ROOT/downloads"
+          rel_tar=$(ls lineage24-*.tar.gz | grep -v -- '-aot' | head -1)
+          aot_tar=$(ls lineage24-*-aot.tar.gz 2>/dev/null | head -1 || true)
+          echo "system: $rel_tar"
+          echo "aot:    ${aot_tar:-none}"
+          mkdir -p release aot
+          tar -xzf "$rel_tar" -C release
+          if [ -d release ] && [ "$(ls release | wc -l)" -eq 1 ]; then
+            rel_dir="release/$(ls release)"
+          else
+            rel_dir="release"
+          fi
+          echo "release directory: $rel_dir"
+          set -- "$CI_ROOT/kernarium/android/lineage-24/tools/install-release.py" \
+            --source "$CI_ROOT/downloads/$rel_dir"
+          if [ -n "$aot_tar" ]; then
+            tar -xzf "$aot_tar" -C aot
+            if [ "$(ls aot | wc -l)" -eq 1 ]; then
+              set -- "$@" --aot-artifact "$CI_ROOT/downloads/aot/$(ls aot)"
+            else
+              set -- "$@" --aot-artifact "$CI_ROOT/downloads/aot"
+            fi
+          fi
+          cd "$CI_ROOT/kernarium"
+          python3 "$@"
+          df -h /
+
+      - name: Configure and build the Android runtime (CMake)
+        run: |
+          cd "$CI_ROOT/kernarium"
+          cmake --preset kernarium-ios-device-android
+          cmake --build --preset kernarium-ios-device-android
+          df -h /
+
+      - name: Package the runtime frameworks
+        run: |
+          cd "$CI_ROOT/kernarium"
+          Kernarium/scripts/package-ios-frameworks.sh --runtimes android
+
+      - name: Stage the system image
+        run: |
+          cd "$CI_ROOT/kernarium"
+          python3 Andarium/scripts/stage-system-image.py
+          du -sh .build/andarium-system
+          df -h /
+
+      - name: Archive unsigned (Release)
+        run: |
+          cd "$CI_ROOT/kernarium/Andarium"
+          xcodebuild -project Andarium.xcodeproj -scheme Andarium \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$CI_ROOT/Andarium.xcarchive" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGN_IDENTITY= \
+            CODE_SIGNING_REQUIRED=NO archive
+          du -sh "$CI_ROOT/Andarium.xcarchive"
+          df -h /
+
+      - name: Ad-hoc sign with entitlements and pack the IPA
+        run: |
+          APP="$CI_ROOT/Andarium.xcarchive/Products/Applications/Andarium.app"
+          ENT="$CI_ROOT/kernarium/Andarium/Config/Andarium.entitlements"
+          ls "$APP"
+          # The nested frameworks first, then the app itself, so the IPA
+          # carries its entitlements (increased memory, extended virtual
+          # addressing) for AltStore/SideStore to keep when re-signing.
+          for fw in "$APP/Frameworks/"*; do
+            codesign --force --sign - "$fw"
+          done
+          codesign --force --sign - --entitlements "$ENT" "$APP"
+          codesign --verify "$APP" && echo "signature verified"
+          mkdir -p "$CI_ROOT/ipa/Payload"
+          cp -R "$APP" "$CI_ROOT/ipa/Payload/"
+          cd "$CI_ROOT/ipa"
+          zip -qry Andarium-tablet.ipa Payload
+          ls -lh "$CI_ROOT/ipa"
+
+      - name: Upload the IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: Andarium-tablet-ipa
+          path: /ci/ipa/Andarium-tablet.ipa
+          compression-level: 0
+          if-no-files-found: error
