@@ -177,6 +177,15 @@ final class LiveRuntime: RuntimeDriver {
                 message: String(localized: "The virtual machine’s screen could not follow this window. Close and reopen Andarium to try again."))
         })
     private var normalRun = false
+    /// The density this run's boot asked for on the person's "Tablet layout"
+    /// choice, or 0 where it asked for none. Set at the start; read to keep
+    /// Android's density override where a window resize would restate the
+    /// display's own (`updateTabletDensity`).
+    private var tabletDensityRun = 0
+    /// The density command last sent to the guest's shell, which another
+    /// would repeat: "" before any was sent (nothing was, so far), "wm…" after
+    /// one was taken. A new run begins with none.
+    private var tabletDensitySent = ""
     /// The device body's turn last given to the camera in this run
     /// (`updateCameraRotation`).
     private var cameraRotationSent: UInt32?
@@ -316,6 +325,7 @@ final class LiveRuntime: RuntimeDriver {
         self.keyboardMouse.setPointerAsTouch(model.pointerAsTouch)
         observeLifecycle()
         observeRotationPolicy()
+        observeTabletLayout()
         observeOverlay()
         preferences.start()
     }
@@ -697,6 +707,14 @@ final class LiveRuntime: RuntimeDriver {
         runMemoryMiB = run.guest.memoryMiB
         let processorCount = UInt32(run.guest.cores)
         let dotsPerInch = geometry.dotsPerInch
+        // "Tablet layout": where the person chose it and the size the start
+        // boots at answers a density, the boot asks for that density instead,
+        // and Android takes the two-column layout of the inner display of a
+        // folding iPhone. The figure holds until the guest powers off; the
+        // shell user's reset below takes it back when the choice goes.
+        let tabletDensity = model?.tabletLayoutDensity(
+            forStartWith: (width: Int(width), height: Int(height), dotsPerInch: Int(dotsPerInch))) ?? 0
+        tabletDensityRun = tabletDensity
         let adbKeyLine = adbIdentity?.publicKeyLine
         // The zone the host is in now, read at every start: the guest follows
         // it while its own automatic time zone is on.
@@ -724,7 +742,8 @@ final class LiveRuntime: RuntimeDriver {
             }
             let result = Self.runGuest(
                 view: view, dataDiskPath: dataDiskPath, releasePath: releasePath, dataGiB: dataGiB, bootMode: bootMode,
-                width: width, height: height, dotsPerInch: dotsPerInch, memoryMiB: memoryMiB,
+                width: width, height: height, dotsPerInch: dotsPerInch, tabletDensity: tabletDensity,
+                memoryMiB: memoryMiB,
                 processorCount: processorCount, adbKeyLine: adbKeyLine, timeZone: timeZone,
                 sessionRecordPath: sessionRecordPath, hostFeatures: hostFeatures, cameraMode: cameraMode,
                 cameraPath: cameraPath, extras: extras, rootBoot: rootBoot
@@ -738,10 +757,14 @@ final class LiveRuntime: RuntimeDriver {
 
     private nonisolated static func runGuest(
         view: GuestMetalView, dataDiskPath: String, releasePath: String, dataGiB: UInt32, bootMode: UInt32,
-        width: UInt32, height: UInt32, dotsPerInch: UInt32, memoryMiB: UInt32,
+        width: UInt32, height: UInt32, dotsPerInch: UInt32, tabletDensity: Int, memoryMiB: UInt32,
         processorCount: UInt32, adbKeyLine: String?, timeZone: String?, sessionRecordPath: String?,
         hostFeatures: UInt32, cameraMode: UInt32, cameraPath: String?, extras: StartExtras, rootBoot: Bool
     ) -> Int32 {
+        // The density the guest is told: "Tablet layout" replaces the
+        // display's own where the person chose it and the size answers one,
+        // and the display's own everywhere else.
+        let statedDotsPerInch = tabletDensity > 0 ? UInt32(tabletDensity) : dotsPerInch
         dataDiskPath.withCString { dataDisk in
             releasePath.withCString { release in
                 withOptionalCString(adbKeyLine) { adbKey in
@@ -752,7 +775,7 @@ final class LiveRuntime: RuntimeDriver {
                                 request.struct_size = UInt32(MemoryLayout<kernarium_runtime_boot>.size)
                                 request.width = width
                                 request.height = height
-                                request.dots_per_inch = dotsPerInch
+                                request.dots_per_inch = statedDotsPerInch
                                 request.guest_memory_mib = memoryMiB
                                 request.guest_processor_count = processorCount
                                 request.android_boot_mode = bootMode
@@ -1112,6 +1135,7 @@ final class LiveRuntime: RuntimeDriver {
             partialSweep?.guestBooted()
             updateThermal()
             updateGuestRotation()
+            updateTabletDensity()
             updateSpaceWatch()
             // An update counts as applied once its start has booted, whatever
             // happens to the application after that.
@@ -1129,6 +1153,10 @@ final class LiveRuntime: RuntimeDriver {
         // reaching sys.boot_completed itself, and its console is read afresh.
         reachedBootCompleted = false
         console?.restarted()
+        // A restart ends the shell connections of the run so far, and the
+        // boot that follows restates the density the start asked for only
+        // where its command is sent again: this counts none as sent.
+        tabletDensitySent = ""
         // No import outlives the restart (the browser stops its transfer
         // below and the guest's adb connections end with it), so the files of
         // the run so far are leftovers to the boot that follows. Only the
@@ -1171,6 +1199,10 @@ final class LiveRuntime: RuntimeDriver {
         // A run that has ended holds nothing: the hold goes with the grant.
         runHasHighRefresh = false
         displayGrantKnown = false
+        // The run's density command is gone with the guest: the next run's
+        // boot states the density again.
+        tabletDensitySent = ""
+        tabletDensityRun = 0
         lowPowerMonitor.stop()
         stopThermalObservation()
         kernarium_runtime_loader_set_restart_handler(nil)
@@ -1276,6 +1308,46 @@ final class LiveRuntime: RuntimeDriver {
         updateGameControllers()
         updateLocation()
         updateKeyboardMouse()
+    }
+
+    /// Keeps Android's density where the person's "Tablet layout" choice put
+    /// it. The boot stated the display's own density or the choice's
+    /// (`androidboot.lcd_density`), which a resize of the window that boots
+    /// no new start does not restate; the shell user's `wm` says it again for
+    /// the display the guest has then, and the reset below clears an override
+    /// of an earlier session. A run that booted with the choice's density and
+    /// lost it mid-run takes the display's own back: a reset alone would
+    /// return to what the boot stated, which was the choice's.
+    private func updateTabletDensity() {
+        guard runActive, let model, let geometry else { return }
+        let natural = Int(geometry.dotsPerInch)
+        let display = (
+            width: Int(geometry.pixelSize.width), height: Int(geometry.pixelSize.height),
+            dotsPerInch: natural)
+        let command: String
+        if let density = model.tabletLayoutDensity(forStartWith: display) {
+            command = TabletLayout.command(density: density)
+        } else if tabletDensityRun > 0 {
+            // The boot replaced the display's density with the choice's, and
+            // the choice is gone: say the display's own, which a reset cannot.
+            command = TabletLayout.command(density: natural)
+        } else {
+            command = TabletLayout.command(density: nil)
+        }
+        guard command != tabletDensitySent else { return }
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let result = try await operations.shell(command, limit: .seconds(15))
+                guard result.exitCode == 0 else {
+                    print("Andarium: the tablet density command failed: \(result.text)")
+                    return
+                }
+                self.tabletDensitySent = command
+            } catch {
+                print("Andarium: the tablet density command was not run: \(error)")
+            }
+        }
     }
 
     /// Tells the camera the turn of the device body: where the host owns the
@@ -1836,6 +1908,22 @@ final class LiveRuntime: RuntimeDriver {
                 guard self.model != nil else { return }
                 self.updateGuestRotation()
                 self.observeRotationPolicy()
+            }
+        }
+    }
+
+    /// The person's "Tablet layout" choice, followed while a guest runs: a
+    /// turn of the switch tells the guest's shell the density the display
+    /// now has, or the reset that returns it to the display's own.
+    private func observeTabletLayout() {
+        guard let model else { return }
+        withObservationTracking {
+            _ = model.tabletLayoutOn
+        } onChange: {
+            Task { @MainActor in
+                guard self.model != nil else { return }
+                self.updateTabletDensity()
+                self.observeTabletLayout()
             }
         }
     }

@@ -179,6 +179,12 @@ struct AppEntry {
             stated: HighRefreshLaunch.stated(in: environment))
         model.highRefreshOn = refresh.isOn
         model.highRefreshDecidedByLaunch = !refresh.keepsChanges
+        // Home's "Tablet layout" is the person's last choice, off at first,
+        // unless the launch is a harness's and decides for its run alone
+        // (`TabletLayoutPreference`).
+        let tablet = TabletLayoutPreference().launch(automated: !launch.isEmpty)
+        model.tabletLayoutOn = tablet.isOn
+        model.tabletLayoutDecidedByLaunch = !tablet.keepsChanges
         // Home's AOT row exists where the build carries the translated-code
         // framework (what Acknowledgements reads), and is the person's last
         // choice unless the launch is a harness's, whichever way it is told.

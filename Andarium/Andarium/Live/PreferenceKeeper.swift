@@ -36,6 +36,7 @@ final class PreferenceKeeper {
         if let on = model.highRefreshToKeep { HighRefreshPreference(defaults: defaults).keep(on) }
         if let on = model.translatedLibrariesToKeep { TranslatedLibrariesPreference(defaults: defaults).keep(on) }
         if let on = model.jitToKeep { JitPreference(defaults: defaults).keep(on) }
+        if let on = model.tabletLayoutToKeep { TabletLayoutPreference(defaults: defaults).keep(on) }
     }
 
     private func observe() {
@@ -44,6 +45,7 @@ final class PreferenceKeeper {
             _ = (model.displayOptionsToKeep, model.showStatsToKeep, model.pointerAsTouchToKeep, model.heatLimitToKeep)
             _ = model.highRefreshToKeep
             _ = (model.translatedLibrariesToKeep, model.jitToKeep)
+            _ = model.tabletLayoutToKeep
         } onChange: { [weak self] in
             // The model belongs to the main actor, so the change begins there;
             // the write waits until it has been made.
